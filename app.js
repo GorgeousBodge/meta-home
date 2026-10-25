@@ -1,47 +1,39 @@
 /* ==========================================================================
-   Home Deck — Home Assistant dashboard for 600×600 smart-glasses displays
+   News Deck — glanceable UK news for 600×600 smart-glasses displays
 
-   Talks to Home Assistant through the /api/ha proxy (api/ha.js on Vercel), so
-   the HA token never reaches the browser. Open once with ?key=YOUR_APP_KEY;
-   the key is then remembered on that device.
-   Add ?demo to the URL (or open the file locally) for mock data.
+   Data comes from /api/news (api/news.js on Vercel). No keys live here.
+   Add ?demo to the URL (or open the file locally) for sample stories.
 
-   Input model: focus-first spatial navigation. Neural band gestures should
-   arrive as directional + select + back events; map them in CONFIG.keys.
+   Input: focus-first spatial navigation. Swipes arrive as arrow keys and a
+   pinch as Enter; adjust CONFIG.keys if your runtime sends something else.
    ========================================================================== */
 (() => {
   'use strict';
 
-  const PROXY = '/api/ha';
-  const KEY_STORE = 'homedeck-app-key';
-  const params = new URLSearchParams(location.search);
-  const DEMO = params.has('demo') || location.protocol === 'file:';
-
-  // App key: taken from ?key= once, then kept in this device's storage.
-  const APP_KEY = (() => {
-    const fromUrl = params.get('key');
-    let key = fromUrl || '';
+  // Tabs shown before the first load. After that, the list comes from the
+  // server (SECTIONS in api/news.js), so new topics only need adding there.
+  const DEFAULT_SECTIONS = [
+    { key: 'top', label: 'Top' },
+    { key: 'uk', label: 'UK' },
+    { key: 'local', label: 'Surrey' },
+    { key: 'world', label: 'World' },
+    { key: 'tech', label: 'Tech' },
+    { key: 'gaming', label: 'Gaming' },
+  ];
+  const SECTIONS_STORE = 'newsdeck-sections-v1';
+  let SECTIONS = (() => {
     try {
-      if (fromUrl) localStorage.setItem(KEY_STORE, fromUrl);
-      else key = localStorage.getItem(KEY_STORE) || '';
-    } catch { /* storage unavailable: key lasts for this session only */ }
-    if (fromUrl) history.replaceState(null, '', location.pathname); // hide it from the address bar
-    return key;
+      const saved = JSON.parse(localStorage.getItem(SECTIONS_STORE));
+      if (Array.isArray(saved) && saved.length) return saved;
+    } catch { /* storage unavailable */ }
+    return DEFAULT_SECTIONS;
   })();
 
   const CONFIG = {
-    pollMs: 5000,
-    tvMediaPlayer: null, // e.g. 'media_player.samsung_tv' — null = auto-detect
-    tvRemote: null,      // e.g. 'remote.samsung_tv'
-
-    domains: ['light', 'switch', 'fan', 'climate', 'scene', 'script'],
-    dimmableOpensDetail: true, // false = dimmable lights simply toggle like switches
-    brightnessStep: 5,         // % per left/right press
-    adjustSendDelay: 350,      // ms of no input before a new value is sent to HA
-    repeatDelay: 380,   // ms before hold-to-repeat starts
-    repeatRate: 150,    // ms between repeats
-    wheelVolume: true,  // scroll/wheel adjusts volume on the TV screen
-    // Adjust these if your glasses' runtime emits different key values.
+    endpoint: '/api/news',
+    staleMs: 10 * 60 * 1000, // refetch a section if older than this
+    tabFocusDelay: 280,      // ms a tab must stay focused before it loads
+    voiceLang: 'en-GB',
     keys: {
       up: ['ArrowUp'],
       down: ['ArrowDown'],
@@ -52,360 +44,401 @@
     },
   };
 
-  // Samsung TV: prefer media_player services, fall back to remote KEY_* codes.
-  const TV_ACTIONS = {
-    power:    { svc: ['media_player', 'toggle'], key: 'KEY_POWER' },
-    vol_up:   { svc: ['media_player', 'volume_up'], key: 'KEY_VOLUP' },
-    vol_down: { svc: ['media_player', 'volume_down'], key: 'KEY_VOLDOWN' },
-    mute:     { svc: 'mute', key: 'KEY_MUTE' },
-    play:     { svc: ['media_player', 'media_play_pause'], key: 'KEY_PLAY' },
-    up:       { key: 'KEY_UP' },
-    down:     { key: 'KEY_DOWN' },
-    left:     { key: 'KEY_LEFT' },
-    right:    { key: 'KEY_RIGHT' },
-    ok:       { key: 'KEY_ENTER' },
-    back:     { key: 'KEY_RETURN' },
-    home:     { key: 'KEY_HOME' },
-    source:   { key: 'KEY_SOURCE' },
-    menu:     { key: 'KEY_MENU' },
-    rew:      { key: 'KEY_REWIND' },
-    ffw:      { key: 'KEY_FF' },
-  };
+  const params = new URLSearchParams(location.search);
+  const DEMO = params.has('demo') || location.protocol === 'file:';
+  const STORE = 'newsdeck-cache-v1';
 
-  const DOMAIN_ICON = { light: 'bulb', switch: 'plug', fan: 'fan', climate: 'thermo', scene: 'scene', script: 'run' };
-  const TOGGLEABLE = ['light', 'switch', 'fan'];
+  // Optional app key (only needed if APP_KEY is set in Vercel): taken from
+  // ?key= once, then remembered on this device and hidden from the address bar.
+  const APP_KEY = (() => {
+    const fromUrl = params.get('key');
+    let key = fromUrl || '';
+    try {
+      if (fromUrl) localStorage.setItem('newsdeck-app-key', fromUrl);
+      else key = localStorage.getItem('newsdeck-app-key') || '';
+    } catch { /* storage unavailable */ }
+    if (fromUrl) history.replaceState(null, '', location.pathname);
+    return key;
+  })();
 
-  // One REST call returns every area with its relevant entities.
-  const AREA_TEMPLATE =
-    `{% set ns = namespace(out=[]) %}` +
-    `{% for a in areas() %}` +
-    `{% set e = area_entities(a) | select('match', '(${CONFIG.domains.join('|')})[.]') | list %}` +
-    `{% if e | count > 0 %}{% set ns.out = ns.out + [{'id': a, 'name': area_name(a), 'entities': e}] %}{% endif %}` +
-    `{% endfor %}{{ ns.out | tojson }}`;
-
-  const $ = (sel) => document.querySelector(sel);
+  const $ = (s) => document.querySelector(s);
   const dom = {
-    title: $('#viewTitle'),
-    sub: $('#viewSub'),
-    back: $('#backBtn'),
-    dot: $('#statusDot'),
-    statusText: $('#statusText'),
-    clock: $('#clock'),
-    homeGrid: $('#homeGrid'),
-    roomGrid: $('#roomGrid'),
-    toast: $('#toast'),
-    views: { home: $('#view-home'), room: $('#view-room'), detail: $('#view-detail'), tv: $('#view-tv') },
-    detail: {
-      root: $('#detail'),
-      readout: $('#detailReadout'),
-      value: $('#detailValue'),
-      unit: $('#detailUnit'),
-      caption: $('#detailCaption'),
-      adjust: $('#adjust'),
-      fill: $('#meterFill'),
-      power: $('#detailPower'),
-      powerLabel: $('#detailPowerLabel'),
-    },
+    title: $('#viewTitle'), sub: $('#viewSub'), back: $('#backBtn'),
+    dot: $('#statusDot'), statusText: $('#statusText'), clock: $('#clock'),
+    tabs: $('#tabs'), list: $('#list'), toast: $('#toast'),
+    viewList: $('#view-list'), viewStory: $('#view-story'),
+    meta: $('#storyMeta'), storyTitle: $('#storyTitle'), summary: $('#storySummary'),
+    prev: $('#prevBtn'), speak: $('#speakBtn'), next: $('#nextBtn'),
   };
 
   const state = {
-    areas: [],
-    entities: new Map(),
-    view: 'home',
-    room: null,
-    tv: { player: null, remote: null },
-    homeFocus: null,
-    lastError: '',
-    detail: null, // { id, model, value, lockUntil, timer }
+    section: 'top',
+    view: 'list',
+    cache: loadCache(), // { [section]: { data, at } }
+    storyIndex: 0,
+    listFocusKey: null,
+    loading: null,
+    speakingId: null,
   };
 
   /* ---------------------------------------------------------------------
-     Home Assistant API
+     Data
      --------------------------------------------------------------------- */
-  async function ha(path, method = 'GET', body) {
-    const res = await fetch(`${PROXY}?path=${encodeURIComponent(path)}`, {
-      method,
-      headers: { 'X-App-Key': APP_KEY, 'Content-Type': 'application/json' },
-      body: body === undefined ? undefined : JSON.stringify(body),
+  function loadCache() {
+    try { return JSON.parse(localStorage.getItem(STORE)) || {}; } catch { return {}; }
+  }
+  function saveCache() {
+    try { localStorage.setItem(STORE, JSON.stringify(state.cache)); } catch { /* full or blocked */ }
+  }
+
+  async function fetchSection(key) {
+    if (DEMO) { await new Promise((r) => setTimeout(r, 250)); return demoData(key); }
+    const res = await fetch(`${CONFIG.endpoint}?section=${encodeURIComponent(key)}`, {
+      headers: APP_KEY ? { 'X-App-Key': APP_KEY } : {},
     });
-    const text = await res.text();
-    let data;
-    try { data = JSON.parse(text); } catch { data = text; }
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) throw new Error(APP_KEY ? 'App key is wrong' : 'Open with ?key=… to connect');
     if (!res.ok) {
-      const err = new Error(data?.error || `Request failed (${res.status})`);
-      err.status = res.status;
-      throw err;
+      if (res.status === 404) syncSections(data.sections); // section was removed on the server
+      throw new Error(data.error || `News request failed (${res.status})`);
     }
     return data;
   }
 
-  function callService(domain, service, data) {
-    if (DEMO) return demo.service(domain, service, data);
-    return ha(`services/${domain}/${service}`, 'POST', data);
-  }
+  async function loadSection(key, { force = false } = {}) {
+    const cached = state.cache[key];
+    const fresh = cached && Date.now() - cached.at < CONFIG.staleMs;
+    if (cached) { syncSections(cached.data.sections); renderList(key); }
+    if (fresh && !force) { setStatus(DEMO ? 'demo' : 'live', cached); return; }
 
-  async function fetchStates() {
-    const list = DEMO ? demo.states() : await ha('states');
-    state.entities = new Map(list.map((s) => [s.entity_id, s]));
-  }
-
-  async function fetchAreas() {
-    if (DEMO) return demo.areas();
+    const token = Symbol(key);
+    state.loading = token;
+    setStatus('loading');
     try {
-      const res = await ha('template', 'POST', { template: AREA_TEMPLATE });
-      const areas = typeof res === 'string' ? JSON.parse(res) : res;
-      if (Array.isArray(areas) && areas.length) return areas;
+      const data = await fetchSection(key);
+      syncSections(data.sections);
+      state.cache[key] = { data, at: Date.now() };
+      saveCache();
+      if (data.failed?.length) toast(`Couldn’t reach ${data.failed.join(', ')}`, true);
+      if (state.loading === token && state.section === key) {
+        renderList(key);
+        setStatus(DEMO ? 'demo' : 'live', state.cache[key]);
+      }
     } catch (err) {
-      console.warn('Area lookup failed; grouping by device type instead.', err);
+      console.error(err);
+      if (state.section !== key) return;
+      if (cached) { setStatus('cached', cached); toast('Offline — showing saved news', true); }
+      else { setStatus('offline'); renderError(err); }
+    } finally {
+      if (state.loading === token) state.loading = null;
     }
-    return fallbackAreas();
   }
 
-  function fallbackAreas() {
-    const labels = { light: 'Lights', switch: 'Switches', fan: 'Fans', scene: 'Scenes', script: 'Scripts' };
-    const ids = [...state.entities.keys()];
-    return CONFIG.domains
-      .map((d) => ({ id: `_${d}`, name: labels[d], entities: ids.filter((id) => id.startsWith(`${d}.`)) }))
-      .filter((a) => a.entities.length);
-  }
-
-  function detectTv() {
-    const ids = [...state.entities.keys()];
-    const looksLikeTv = (id) => {
-      const name = state.entities.get(id)?.attributes?.friendly_name || '';
-      return /samsung|(^|[\s._])tv($|[\s._])|television/i.test(`${id} ${name}`);
-    };
-    const find = (domain) => ids.find((id) => id.startsWith(`${domain}.`) && looksLikeTv(id));
-
-    const player = CONFIG.tvMediaPlayer || find('media_player') || null;
-    let remote = CONFIG.tvRemote || null;
-    if (!remote && player) {
-      const twin = `remote.${player.split('.')[1]}`;
-      if (state.entities.has(twin)) remote = twin;
-    }
-    if (!remote) remote = find('remote') || null;
-    state.tv = { player, remote };
-  }
-
-  /* ---------------------------------------------------------------------
-     Entity helpers
-     --------------------------------------------------------------------- */
-  const domainOf = (id) => id.split('.')[0];
-  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-  const fmtNum = (v) => (v == null || Number.isNaN(+v) ? '--' : String(Math.round(v * 10) / 10));
-
-  function isDimmable(id) {
-    if (domainOf(id) !== 'light') return false;
-    const a = state.entities.get(id)?.attributes || {};
-    if (a.brightness != null) return true;
-    return Array.isArray(a.supported_color_modes) && a.supported_color_modes.some((m) => m !== 'onoff');
-  }
-
-  const hasDetail = (id) =>
-    domainOf(id) === 'climate' || (CONFIG.dimmableOpensDetail && isDimmable(id));
-  const icon = (name, cls = '') =>
-    `<svg class="ico ${cls}" aria-hidden="true"><use href="#i-${name}"/></svg>`;
-
-  function displayName(id, areaName) {
-    const s = state.entities.get(id);
-    let name = s?.attributes?.friendly_name || id.split('.')[1].replace(/_/g, ' ');
-    if (areaName && name.toLowerCase().startsWith(`${areaName.toLowerCase()} `)) {
-      const rest = name.slice(areaName.length).trim();
-      if (rest) name = rest.charAt(0).toUpperCase() + rest.slice(1);
-    }
-    return name;
-  }
-
-  function entityStatus(id) {
-    const s = state.entities.get(id);
-    const d = domainOf(id);
-    if (!s || s.state === 'unavailable' || s.state === 'unknown') return { text: 'Offline', on: false, na: true };
-    if (d === 'scene') return { text: 'Activate', on: false };
-    if (d === 'script') return { text: s.state === 'on' ? 'Running' : 'Run', on: s.state === 'on' };
-    if (d === 'climate') {
-      const a = s.attributes || {};
-      if (s.state === 'off') return { text: `Off · ${fmtNum(a.current_temperature)}°`, on: false };
-      return { text: `${fmtNum(a.current_temperature)}° → ${fmtNum(a.temperature)}°`, on: true };
-    }
-    const on = s.state === 'on';
-    if (d === 'light' && on && s.attributes?.brightness != null) {
-      return { text: `On · ${Math.round(s.attributes.brightness / 2.55)}%`, on };
-    }
-    return { text: on ? 'On' : 'Off', on };
-  }
-
-  function areaSummary(area) {
-    const toggles = area.entities.filter((id) => TOGGLEABLE.includes(domainOf(id)));
-    if (!toggles.length) return { text: `${area.entities.length} actions`, on: 0 };
-    const on = toggles.filter((id) => state.entities.get(id)?.state === 'on').length;
-    return { text: on ? `${on} of ${toggles.length} on` : 'All off', on };
-  }
-
-  function tvSummary() {
-    const s = state.entities.get(state.tv.player);
-    if (!state.tv.player && !state.tv.remote) return 'Not found';
-    if (!s) return 'Ready';
-    if (s.state === 'off' || s.state === 'standby') return 'Off';
-    if (s.state === 'unavailable') return 'Offline';
-    const vol = s.attributes?.volume_level;
-    const muted = s.attributes?.is_volume_muted;
-    return `On${vol != null ? ` · Vol ${Math.round(vol * 100)}` : ''}${muted ? ' · Muted' : ''}`;
-  }
+  const sectionData = () => state.cache[state.section]?.data || null;
 
   /* ---------------------------------------------------------------------
      Rendering
      --------------------------------------------------------------------- */
-  function makeTile({ key, name, meta, iconName, extraClass = '', more = false, onSelect }) {
+  function timeAgo(iso) {
+    const t = Date.parse(iso);
+    if (!Number.isFinite(t)) return '';
+    const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
+    if (mins < 1) return 'Now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.round(hrs / 24)}d ago`;
+  }
+
+  function syncSections(list) {
+    if (!Array.isArray(list) || !list.length) return;
+    const clean = list.filter((s) => s && s.key).map((s) => ({ key: String(s.key), label: String(s.label || s.key) }));
+    if (JSON.stringify(clean) === JSON.stringify(SECTIONS)) return;
+    SECTIONS = clean;
+    try { localStorage.setItem(SECTIONS_STORE, JSON.stringify(clean)); } catch { /* ignore */ }
+    for (const k of Object.keys(state.cache)) if (!clean.some((s) => s.key === k)) delete state.cache[k];
+    saveCache();
+    renderTabs();
+    if (!clean.some((s) => s.key === state.section)) {
+      selectSection(clean[0].key).then(() => { if (state.view === 'list') focusFirstCard(); });
+    }
+  }
+
+  function renderTabs() {
+    const focusedKey = dom.tabs.contains(document.activeElement) ? document.activeElement.dataset.section : null;
+    const tabs = SECTIONS.map((s) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'tab focusable';
+      b.textContent = s.label;
+      b.dataset.section = s.key;
+      b._select = () => { selectSection(s.key); focusFirstCard(); };
+      b.addEventListener('focus', () => {
+        clearTimeout(b._timer);
+        b._timer = setTimeout(() => { if (document.activeElement === b) selectSection(s.key); }, CONFIG.tabFocusDelay);
+      });
+      return b;
+    });
+    dom.tabs.replaceChildren(...tabs);
+    markActiveTab();
+    if (focusedKey) {
+      const again = dom.tabs.querySelector(`[data-section="${CSS.escape(focusedKey)}"]`);
+      if (again) focusEl(again);
+    }
+  }
+
+  function markActiveTab() {
+    for (const t of dom.tabs.children) t.classList.toggle('is-active', t.dataset.section === state.section);
+  }
+
+  function makeCard(cls, titleText, metaHtml) {
     const b = document.createElement('button');
     b.type = 'button';
-    b.className = `tile focusable ${extraClass}`.trim();
-    b.dataset.key = key;
-    b.innerHTML =
-      (more ? `<span class="tile-more">${icon('chev', 'rot-90')}</span>` : '') +
-      `<span class="tile-icon">${icon(iconName)}</span>` +
-      `<span class="tile-text"><span class="tile-name"></span><span class="tile-meta"></span></span>`;
-    b.querySelector('.tile-name').textContent = name; // textContent: names are user data
-    b.querySelector('.tile-meta').textContent = meta;
-    b._select = onSelect;
+    b.className = `card focusable ${cls}`.trim();
+    const title = document.createElement('span');
+    title.className = 'card-title';
+    title.textContent = titleText;
+    const meta = document.createElement('span');
+    meta.className = 'card-meta';
+    meta.innerHTML = metaHtml; // built only from escaped values below
+    b.append(title, meta);
     return b;
   }
 
-  function renderHome() {
-    const tiles = [
-      makeTile({
-        key: 'tv', name: 'TV Remote', meta: tvSummary(), iconName: 'tv',
-        extraClass: 'tile-feature', onSelect: () => openView('tv'),
-      }),
-      ...state.areas.map((area) => makeTile({
-        key: `area:${area.id}`, name: area.name, meta: areaSummary(area).text,
-        iconName: 'door', onSelect: () => openRoom(area),
-      })),
-    ];
-    dom.homeGrid.replaceChildren(...tiles);
-    if (!state.areas.length) {
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  function renderList(key) {
+    if (key !== state.section) return;
+    const data = sectionData();
+    if (!data) return;
+
+    const hadFocus = dom.list.contains(document.activeElement);
+    const focusKey = hadFocus ? document.activeElement.dataset.key : null;
+
+    const brief = makeCard('card-brief', 'Listen to briefing', '');
+    brief.dataset.key = 'brief';
+    brief.querySelector('.card-meta').remove();
+    brief.insertAdjacentHTML('afterbegin', '<svg class="ico" aria-hidden="true"><use href="#i-speak"/></svg>');
+    const words = (data.briefing || '').split(/\s+/).length;
+    const sub = document.createElement('span');
+    sub.className = 'card-meta';
+    sub.textContent = `≈${Math.max(10, Math.round(words / 2.6 / 5) * 5)} sec`;
+    const wrap = document.createElement('span');
+    wrap.style.cssText = 'display:flex;flex-direction:column;gap:4px;min-width:0';
+    wrap.append(brief.querySelector('.card-title'), sub);
+    brief.append(wrap);
+    brief._select = () => toggleSpeak('brief', data.briefing, brief);
+    brief.classList.toggle('is-speaking', state.speakingId === 'brief');
+
+    const cards = data.items.map((item, i) => {
+      const ago = timeAgo(item.published);
+      const c = makeCard('', item.title, `<b>${esc(item.source)}</b>${ago ? ` · ${esc(ago)}` : ''}`);
+      c.dataset.key = item.id;
+      c._select = () => openStory(i);
+      return c;
+    });
+
+    if (!cards.length) {
       const p = document.createElement('p');
-      p.className = 'empty';
-      p.textContent = state.lastError || 'No rooms found yet';
-      dom.homeGrid.append(p);
+      p.className = 'notice';
+      p.textContent = 'No stories right now';
+      dom.list.replaceChildren(brief, p);
+    } else {
+      dom.list.replaceChildren(brief, ...cards);
     }
-    refreshVisible();
-  }
-
-  function renderRoom(area) {
-    const tiles = area.entities.map((id) => makeTile({
-      key: id,
-      name: displayName(id, area.name),
-      meta: '',
-      iconName: DOMAIN_ICON[domainOf(id)] || 'bulb',
-      more: hasDetail(id),
-      onSelect: () => (hasDetail(id) ? openDetail(id) : toggleEntity(id)),
-    }));
-    dom.roomGrid.replaceChildren(...tiles);
-    refreshVisible();
-  }
-
-  function setTileStatus(tile, text, on, na) {
-    tile.querySelector('.tile-meta').textContent = text;
-    tile.classList.toggle('is-on', !!on);
-    tile.classList.toggle('is-unavailable', !!na);
-  }
-
-  // Update text/classes in place so focus is never lost during polling.
-  function refreshVisible() {
-    for (const tile of dom.homeGrid.querySelectorAll('.tile')) {
-      if (tile.dataset.key === 'tv') {
-        tile.querySelector('.tile-meta').textContent = tvSummary();
-      } else {
-        const area = state.areas.find((a) => `area:${a.id}` === tile.dataset.key);
-        if (area) { const s = areaSummary(area); setTileStatus(tile, s.text, s.on > 0); }
-      }
-    }
-    for (const tile of dom.roomGrid.querySelectorAll('.tile')) {
-      const s = entityStatus(tile.dataset.key);
-      setTileStatus(tile, s.text, s.on, s.na);
-    }
-    const player = state.entities.get(state.tv.player);
-    document.querySelector('[data-tv="mute"]').classList.toggle('is-on', !!player?.attributes?.is_volume_muted);
-    if (state.view === 'detail') renderDetail();
     updateHud();
+
+    if (focusKey) {
+      const again = dom.list.querySelector(`[data-key="${CSS.escape(focusKey)}"]`);
+      if (again) focusEl(again);
+    }
+  }
+
+  function renderError(err) {
+    const p = document.createElement('p');
+    p.className = 'notice';
+    p.textContent = err.message || 'Couldn’t load the news';
+    const retry = makeCard('', 'Try again', 'Reload this section');
+    retry.dataset.key = 'retry';
+    retry._select = () => loadSection(state.section, { force: true });
+    dom.list.replaceChildren(p, retry);
+  }
+
+  function renderLoading() {
+    const p = document.createElement('p');
+    p.className = 'notice';
+    p.textContent = 'Loading headlines…';
+    dom.list.replaceChildren(p);
   }
 
   function updateHud() {
-    if (state.view === 'home') {
-      dom.sub.textContent = state.areas.length ? `${state.areas.length} rooms` : '';
-    } else if (state.view === 'room' && state.room) {
-      dom.sub.textContent = areaSummary(state.room).text;
-    } else if (state.view === 'detail') {
-      dom.sub.textContent = state.room?.name || '';
-    } else if (state.view === 'tv') {
-      dom.sub.textContent = tvSummary();
+    const data = sectionData();
+    if (state.view === 'list') {
+      dom.title.textContent = 'News';
+      dom.sub.textContent = data?.label || SECTIONS.find((s) => s.key === state.section)?.label || '';
+    } else {
+      dom.title.textContent = data?.label || 'Story';
+      dom.sub.textContent = data ? `${state.storyIndex + 1} of ${data.items.length}` : '';
     }
+  }
+
+  function setStatus(mode, entry) {
+    dom.dot.dataset.status = mode;
+    const time = entry ? new Date(entry.at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : '';
+    dom.statusText.textContent = {
+      live: time ? `@${time}` : 'Live',
+      cached: 'Saved',
+      offline: 'Offline',
+      demo: 'Demo',
+      loading: 'Loading',
+    }[mode];
   }
 
   /* ---------------------------------------------------------------------
-     Views & navigation
+     Views
      --------------------------------------------------------------------- */
-  function openView(name, title, focusTarget) {
-    if (state.view === 'home' && name !== 'home') state.homeFocus = document.activeElement;
-    for (const [key, el] of Object.entries(dom.views)) el.hidden = key !== name;
-    state.view = name;
-    dom.title.textContent = title || dom.views[name].dataset.title;
-    dom.back.hidden = name === 'home';
-    if (!focusTarget) dom.views[name].scrollTop = 0;
+  function selectSection(key) {
+    if (key === state.section && sectionData()) return Promise.resolve();
+    stopSpeaking();
+    state.section = key;
+    markActiveTab();
+    dom.list.scrollTop = 0;
+    if (!state.cache[key]) renderLoading();
     updateHud();
-
-    const restore = name === 'home' && state.homeFocus?.isConnected ? state.homeFocus : null;
-    focusEl(focusTarget || restore || firstFocusable(name));
+    return loadSection(key);
   }
 
-  function openRoom(area) {
-    state.room = area;
-    renderRoom(area);
-    openView('room', area.name);
+  function focusFirstCard() {
+    const first = dom.list.querySelector('.card:not(.card-brief)') || dom.list.querySelector('.focusable');
+    if (first) focusEl(first);
+  }
+
+  function openStory(i) {
+    const data = sectionData();
+    if (!data?.items[i]) return;
+    stopSpeaking();
+    state.storyIndex = i;
+    state.view = 'story';
+    dom.viewList.hidden = true;
+    dom.viewStory.hidden = false;
+    dom.back.hidden = false;
+    paintStory();
+    focusEl(dom.next.disabled ? dom.speak : dom.next);
+  }
+
+  function paintStory() {
+    const data = sectionData();
+    const item = data.items[state.storyIndex];
+    const ago = timeAgo(item.published);
+    dom.meta.innerHTML = `<b>${esc(item.source)}</b>${ago ? ` · ${esc(ago)}` : ''}`;
+    dom.storyTitle.textContent = item.title;
+    dom.summary.textContent = item.summary || 'No summary available for this story.';
+    dom.prev.disabled = state.storyIndex === 0;
+    dom.next.disabled = state.storyIndex >= data.items.length - 1;
+    setSpeakLabel(state.speakingId === item.id);
+    updateHud();
+  }
+
+  function stepStory(dir) {
+    const data = sectionData();
+    const i = state.storyIndex + dir;
+    if (!data || i < 0 || i >= data.items.length) { bump(document.activeElement); return; }
+    stopSpeaking();
+    state.storyIndex = i;
+    paintStory();
+    if (document.activeElement?.disabled) focusEl(dom.speak);
+  }
+
+  function backToList() {
+    stopSpeaking();
+    const item = sectionData()?.items[state.storyIndex];
+    state.view = 'list';
+    dom.viewStory.hidden = true;
+    dom.viewList.hidden = false;
+    dom.back.hidden = true;
+    updateHud();
+    const card = item && dom.list.querySelector(`[data-key="${CSS.escape(item.id)}"]`);
+    focusEl(card || dom.list.querySelector('.focusable'));
   }
 
   function goBack() {
-    if (state.view === 'detail' && state.room) {
-      const id = state.detail?.id;
-      flushAdjust();
-      const tile = id ? dom.roomGrid.querySelector(`[data-key="${CSS.escape(id)}"]`) : null;
-      openView('room', state.room.name, tile);
-    } else if (state.view !== 'home') {
-      openView('home');
-    } else {
-      bump(document.activeElement);
-    }
+    if (state.view === 'story') backToList();
+    else if (dom.list.contains(document.activeElement)) focusEl(dom.tabs.querySelector('.is-active'));
+    else bump(document.activeElement);
   }
 
+  /* ---------------------------------------------------------------------
+     Speech (speechSynthesis — supported on the Display for short content)
+     --------------------------------------------------------------------- */
+  const canSpeak = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
+  let voice = null;
+  function pickVoice() {
+    if (!canSpeak) return;
+    const voices = speechSynthesis.getVoices();
+    voice = voices.find((v) => v.lang === CONFIG.voiceLang) ||
+            voices.find((v) => v.lang?.startsWith('en')) || null;
+  }
+  if (canSpeak) { pickVoice(); speechSynthesis.addEventListener?.('voiceschanged', pickVoice); }
+
+  function toggleSpeak(id, text, el) {
+    if (!canSpeak) { toast('Speech isn’t available here', true); return; }
+    if (state.speakingId === id) { stopSpeaking(); return; }
+    stopSpeaking();
+    if (!text) return;
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = CONFIG.voiceLang;
+    if (voice) u.voice = voice;
+    u.rate = 1.02;
+    const done = () => { if (state.speakingId === id) stopSpeaking(); };
+    u.onend = done;
+    u.onerror = done;
+    state.speakingId = id;
+    el?.classList.add('is-speaking');
+    if (state.view === 'story') setSpeakLabel(true);
+    speechSynthesis.speak(u);
+  }
+
+  function stopSpeaking() {
+    if (canSpeak) speechSynthesis.cancel();
+    state.speakingId = null;
+    dom.list.querySelector('.is-speaking')?.classList.remove('is-speaking');
+    setSpeakLabel(false);
+  }
+
+  function setSpeakLabel(on) {
+    dom.speak.querySelector('use').setAttribute('href', on ? '#i-stop' : '#i-speak');
+    dom.speak.querySelector('.key-label').textContent = on ? 'Stop' : 'Listen';
+  }
+
+  /* ---------------------------------------------------------------------
+     Navigation (geometric: nearest focusable in the swipe direction)
+     --------------------------------------------------------------------- */
   function focusables() {
-    return [...document.querySelectorAll(
-      `#view-${state.view} .focusable, .hud .focusable`
-    )].filter((el) => !el.hidden && !el.disabled && el.offsetParent !== null);
-  }
-
-  function firstFocusable(view) {
-    const root = dom.views[view];
-    return root.querySelector('[data-autofocus]') || root.querySelector('.focusable');
+    const root = state.view === 'list' ? dom.viewList : dom.viewStory;
+    return [...root.querySelectorAll('.focusable'), dom.back]
+      .filter((el) => !el.hidden && !el.disabled && el.offsetParent !== null);
   }
 
   function focusEl(el) {
     if (!el) return;
     el.focus({ preventScroll: true });
-    el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'smooth' });
   }
 
-  // Geometric spatial navigation: nearest element in the pressed direction.
   function move(dir) {
     const items = focusables();
     const cur = document.activeElement;
     if (!items.includes(cur)) { focusEl(items[0]); return; }
-
+    // Sideways on a story card changes section rather than jumping up to a tab.
+    if (state.view === 'list' && (dir === 'left' || dir === 'right') && dom.list.contains(cur)) {
+      cycleSection(dir === 'right' ? 1 : -1);
+      return;
+    }
     const r = cur.getBoundingClientRect();
     const cx = r.left + r.width / 2;
     const cy = r.top + r.height / 2;
     let best = null;
     let bestScore = Infinity;
-
     for (const el of items) {
       if (el === cur) continue;
       const b = el.getBoundingClientRect();
@@ -417,8 +450,20 @@
       const score = along + across * 2;
       if (score < bestScore) { bestScore = score; best = el; }
     }
+    // Leaving the list upwards lands on the current section's tab, not whichever is nearest.
+    if (best?.classList.contains('tab') && dom.list.contains(cur)) best = dom.tabs.querySelector('.is-active') || best;
     if (best) focusEl(best);
     else bump(cur);
+  }
+
+  function cycleSection(dir) {
+    const i = SECTIONS.findIndex((s) => s.key === state.section);
+    const next = SECTIONS[(i + dir + SECTIONS.length) % SECTIONS.length];
+    toast(next.label);
+    focusEl(dom.tabs.querySelector(`[data-section="${next.key}"]`)); // hold focus while loading
+    selectSection(next.key).then(() => {
+      if (state.section === next.key && state.view === 'list') focusFirstCard();
+    });
   }
 
   function activate(el) {
@@ -427,243 +472,6 @@
     el._select();
   }
 
-  /* ---------------------------------------------------------------------
-     Actions
-     --------------------------------------------------------------------- */
-  async function toggleEntity(id) {
-    const d = domainOf(id);
-    const s = state.entities.get(id);
-    if (s && (s.state === 'unavailable' || s.state === 'unknown')) { toast('Device offline', true); return; }
-
-    if (d === 'scene' || d === 'script') {
-      await safely(() => callService(d, 'turn_on', { entity_id: id }));
-      toast(`${displayName(id, state.room?.name)} ✓`);
-      return;
-    }
-    if (s) { s.state = s.state === 'on' ? 'off' : 'on'; refreshVisible(); } // optimistic
-    await safely(() => callService('homeassistant', 'toggle', { entity_id: id }));
-    schedulePoll(700);
-  }
-
-  /* ---------------------------------------------------------------------
-     Detail / adjust mode: ◀ ▶ change brightness or target temperature
-     --------------------------------------------------------------------- */
-  function detailModel(id) {
-    const s = state.entities.get(id);
-    const kind = domainOf(id) === 'climate' ? 'climate' : 'light';
-    if (!s || s.state === 'unavailable' || s.state === 'unknown') {
-      return { kind, unavailable: true, on: false, value: 0, min: 0, max: 100, meterMin: 0, step: 1, unit: '', caption: 'Offline' };
-    }
-    const a = s.attributes || {};
-    if (kind === 'light') {
-      const on = s.state === 'on';
-      const value = on && a.brightness != null ? Math.round(a.brightness / 2.55) : on ? 100 : 0;
-      return {
-        kind, on, value,
-        min: CONFIG.brightnessStep, max: 100, meterMin: 0, step: CONFIG.brightnessStep, unit: '%',
-        caption: on ? 'Brightness · ◀ ▶ adjust' : 'Off · ▶ to turn on',
-      };
-    }
-    const min = a.min_temp ?? 7;
-    const max = a.max_temp ?? 35;
-    return {
-      kind,
-      on: s.state !== 'off',
-      value: a.temperature ?? a.current_temperature ?? min,
-      min, max, meterMin: min,
-      step: a.target_temp_step ?? 0.5,
-      unit: '°',
-      caption: `Now ${fmtNum(a.current_temperature)}° · ${a.hvac_action || s.state}`,
-    };
-  }
-
-  function openDetail(id) {
-    state.detail = { id, model: null, value: null, lockUntil: 0, timer: null };
-    renderDetail(true);
-    openView('detail', displayName(id, state.room?.name));
-  }
-
-  // Polls refresh the readout, except just after local input (so it doesn't jump back).
-  function renderDetail(force = false) {
-    const det = state.detail;
-    if (!det) return;
-    det.model = detailModel(det.id);
-    if (force || performance.now() > det.lockUntil) det.value = det.model.value;
-    paintDetail();
-  }
-
-  function paintDetail() {
-    const { model: m, value } = state.detail;
-    const off = !m.on && m.kind === 'light';
-    const d = dom.detail;
-    d.root.dataset.kind = m.kind;
-    d.value.textContent = m.unavailable ? '--' : off ? 'Off' : fmtNum(value);
-    d.unit.textContent = off || m.unavailable ? '' : m.unit;
-    d.readout.classList.toggle('is-off', !m.on);
-    d.caption.textContent = m.caption;
-    const pct = off ? 0 : ((value - m.meterMin) / (m.max - m.meterMin)) * 100;
-    d.fill.style.width = `${clamp(pct, 0, 100)}%`;
-    d.adjust.setAttribute('aria-valuemin', m.min);
-    d.adjust.setAttribute('aria-valuemax', m.max);
-    d.adjust.setAttribute('aria-valuenow', off ? 0 : value);
-    d.powerLabel.textContent = m.on ? 'Turn off' : 'Turn on';
-    d.power.classList.toggle('is-on', m.on);
-  }
-
-  function adjustBy(dir) {
-    const det = state.detail;
-    if (!det?.model) return;
-    const m = det.model;
-    if (m.unavailable) { toast('Device offline', true); return; }
-
-    let v;
-    if (m.kind === 'light') {
-      if (!m.on && dir < 0) { bump(dom.detail.adjust); return; }
-      const base = m.on ? det.value : 0;
-      v = clamp(Math.round(base / m.step) * m.step + dir * m.step, m.min, m.max);
-    } else {
-      v = clamp(Math.round((det.value + dir * m.step) / m.step) * m.step, m.min, m.max);
-      v = Math.round(v * 10) / 10;
-    }
-    if (v === det.value && m.on) { bump(dom.detail.adjust); return; }
-
-    det.value = v;
-    det.lockUntil = performance.now() + 2500;
-
-    // Optimistic local update so tiles and readout respond instantly.
-    const s = state.entities.get(det.id);
-    if (s) {
-      if (m.kind === 'light') { s.state = 'on'; s.attributes.brightness = Math.round(v * 2.55); }
-      else s.attributes.temperature = v;
-    }
-    refreshVisible();
-
-    clearTimeout(det.timer);
-    det.timer = setTimeout(sendAdjust, CONFIG.adjustSendDelay);
-  }
-
-  function sendAdjust() {
-    const det = state.detail;
-    if (!det) return;
-    clearTimeout(det.timer);
-    det.timer = null;
-    const { id, value } = det;
-    const kind = det.model.kind;
-    safely(() => (kind === 'light'
-      ? callService('light', 'turn_on', { entity_id: id, brightness_pct: value })
-      : callService('climate', 'set_temperature', { entity_id: id, temperature: value })
-    )).then(() => schedulePoll(800));
-  }
-
-  function flushAdjust() {
-    if (state.detail?.timer) sendAdjust();
-  }
-
-  async function detailPower() {
-    const det = state.detail;
-    if (!det?.model || det.model.unavailable) return;
-    flushAdjust();
-    const { id, model: m } = det;
-    const s = state.entities.get(id);
-    det.lockUntil = 0;
-
-    if (m.kind === 'light') {
-      if (s) s.state = m.on ? 'off' : 'on';
-      refreshVisible();
-      await safely(() => callService('light', m.on ? 'turn_off' : 'turn_on', { entity_id: id }));
-    } else {
-      if (s) s.state = m.on ? 'off' : (s.attributes?.hvac_modes || []).find((x) => x !== 'off') || 'heat';
-      refreshVisible();
-      await safely(() => callService('climate', m.on ? 'turn_off' : 'turn_on', { entity_id: id }));
-    }
-    schedulePoll(700);
-  }
-
-  const tvBusy = new Set();
-  async function runTv(name) {
-    const action = TV_ACTIONS[name];
-    if (!action || tvBusy.has(name)) return; // drop repeats while a call is in flight
-    const { player, remote } = state.tv;
-    tvBusy.add(name);
-    try {
-      await safely(async () => {
-        if (action.svc && player) {
-          if (action.svc === 'mute') {
-            const muted = !!state.entities.get(player)?.attributes?.is_volume_muted;
-            return callService('media_player', 'volume_mute', { entity_id: player, is_volume_muted: !muted });
-          }
-          return callService(action.svc[0], action.svc[1], { entity_id: player });
-        }
-        if (action.key && remote) {
-          return callService('remote', 'send_command', { entity_id: remote, command: action.key });
-        }
-        throw new Error(remote ? 'No TV media player found' : 'No TV remote entity found');
-      });
-    } finally {
-      tvBusy.delete(name);
-    }
-    schedulePoll(500);
-  }
-
-  async function safely(fn) {
-    try {
-      return await fn();
-    } catch (err) {
-      console.error(err);
-      toast(friendlyError(err), true);
-      schedulePoll(300);
-      return null;
-    }
-  }
-
-  function friendlyError(err) {
-    if (err?.status === 401) return APP_KEY ? 'App key is wrong' : 'Open with ?key=… to connect';
-    if (err instanceof TypeError) return 'Can’t reach Home Assistant';
-    return err?.message || 'Something went wrong';
-  }
-
-  /* ---------------------------------------------------------------------
-     Polling & status
-     --------------------------------------------------------------------- */
-  let polling = false;
-  let pollTimer = null;
-
-  async function poll() {
-    if (polling || document.hidden) return;
-    polling = true;
-    try {
-      await fetchStates();
-      state.lastError = '';
-      if (!state.areas.length) {
-        state.areas = await fetchAreas();
-        detectTv();
-        renderHome();
-        if (state.view === 'home') focusEl(firstFocusable('home'));
-      }
-      refreshVisible();
-      setStatus(DEMO ? 'demo' : 'online');
-    } catch (err) {
-      console.error(err);
-      setStatus('offline');
-    } finally {
-      polling = false;
-    }
-  }
-
-  function schedulePoll(ms) {
-    clearTimeout(pollTimer);
-    pollTimer = setTimeout(poll, ms);
-  }
-
-  function setStatus(mode) {
-    const label = { online: 'Online', offline: 'Offline', demo: 'Demo', connecting: 'Linking' }[mode];
-    dom.dot.dataset.status = mode;
-    dom.statusText.textContent = label;
-  }
-
-  /* ---------------------------------------------------------------------
-     Feedback
-     --------------------------------------------------------------------- */
   function pressFx(el) {
     el.classList.remove('is-pressed');
     void el.offsetWidth;
@@ -687,6 +495,40 @@
     toastTimer = setTimeout(() => dom.toast.classList.remove('is-visible'), 2200);
   }
 
+  function bindInput() {
+    const keyMap = new Map();
+    for (const [action, keys] of Object.entries(CONFIG.keys)) keys.forEach((k) => keyMap.set(k, action));
+
+    document.addEventListener('keydown', (e) => {
+      const action = keyMap.get(e.key);
+      if (!action) return;
+      e.preventDefault();
+      if (e.repeat && (action === 'select' || action === 'back')) return;
+      if (action === 'back') { goBack(); return; }
+      if (action === 'select') {
+        const el = document.activeElement;
+        if (el?.classList?.contains('focusable')) activate(el);
+        else focusEl(focusables()[0]);
+        return;
+      }
+      move(action);
+    });
+    document.addEventListener('keyup', (e) => { if (e.key === ' ') e.preventDefault(); });
+
+    document.addEventListener('click', (e) => {
+      const el = e.target.closest('.focusable');
+      if (el) activate(el);
+    });
+
+    dom.back._select = backToList;
+    dom.prev._select = () => stepStory(-1);
+    dom.next._select = () => stepStory(1);
+    dom.speak._select = () => {
+      const item = sectionData()?.items[state.storyIndex];
+      if (item) toggleSpeak(item.id, `${item.title}. ${item.summary || ''}`);
+    };
+  }
+
   function startClock() {
     const tick = () => {
       dom.clock.textContent = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
@@ -696,211 +538,48 @@
   }
 
   /* ---------------------------------------------------------------------
-     Input: gestures / keys / pointer / wheel
+     Demo data
      --------------------------------------------------------------------- */
-  function bindInput() {
-    const keyMap = new Map();
-    for (const [action, keys] of Object.entries(CONFIG.keys)) keys.forEach((k) => keyMap.set(k, action));
-    let lastRepeat = 0;
-
-    document.addEventListener('keydown', (e) => {
-      const action = keyMap.get(e.key);
-      if (!action) return;
-      e.preventDefault();
-
-      if (action === 'back') { if (!e.repeat) goBack(); return; }
-
-      // Adjust mode: left/right change the value instead of moving focus (key repeat = hold).
-      if ((action === 'left' || action === 'right') && document.activeElement === dom.detail.adjust) {
-        adjustBy(action === 'right' ? 1 : -1);
-        return;
-      }
-
-      if (action === 'select') {
-        const el = document.activeElement;
-        if (!el?.classList?.contains('focusable')) { focusEl(firstFocusable(state.view)); return; }
-        if (e.repeat) {
-          const now = performance.now();
-          if (el.dataset.repeat !== undefined && now - lastRepeat >= CONFIG.repeatRate) {
-            lastRepeat = now;
-            activate(el);
-          }
-          return;
-        }
-        activate(el);
-        return;
-      }
-      move(action);
-    });
-    // Stop Space from firing a second native click on keyup.
-    document.addEventListener('keyup', (e) => { if (e.key === ' ') e.preventDefault(); });
-
-    // Pointer / touch / pinch-click
-    document.addEventListener('click', (e) => {
-      const el = e.target.closest('.focusable');
-      if (el) activate(el);
-    });
-
-    // Hold-to-repeat for volume, D-pad and seek
-    let holdTimer = null;
-    let holdInterval = null;
-    const stopHold = () => { clearTimeout(holdTimer); clearInterval(holdInterval); };
-    document.addEventListener('pointerdown', (e) => {
-      const el = e.target.closest('[data-repeat]');
-      if (!el) return;
-      stopHold();
-      holdTimer = setTimeout(() => {
-        holdInterval = setInterval(() => activate(el), CONFIG.repeatRate);
-      }, CONFIG.repeatDelay);
-    });
-    document.addEventListener('pointerup', stopHold);
-    document.addEventListener('pointercancel', stopHold);
-    window.addEventListener('blur', stopHold);
-
-    // Wheel/scroll → value on the adjust screen, volume on the TV screen
-    let wheelAt = 0;
-    document.addEventListener('wheel', (e) => {
-      if (!CONFIG.wheelVolume || (state.view !== 'tv' && state.view !== 'detail')) return;
-      e.preventDefault();
-      const now = performance.now();
-      if (now - wheelAt < (state.view === 'detail' ? 120 : 180)) return;
-      wheelAt = now;
-      if (state.view === 'detail') { adjustBy(e.deltaY < 0 ? 1 : -1); return; }
-      const name = e.deltaY < 0 ? 'vol_up' : 'vol_down';
-      pressFx(document.querySelector(`[data-tv="${name}"]`));
-      runTv(name);
-    }, { passive: false });
-
-    dom.back._select = goBack;
-
-    // Adjust bar: select confirms and returns; tapping its ends (touch/mouse) steps the value.
-    dom.detail.adjust._select = goBack;
-    dom.detail.adjust.addEventListener('click', (e) => {
-      const r = dom.detail.adjust.getBoundingClientRect();
-      const x = (e.clientX - r.left) / r.width;
-      if (e.detail === 0 || (x > 0.25 && x < 0.75)) return; // keyboard or middle: let it confirm
-      e.stopPropagation();
-      pressFx(dom.detail.adjust);
-      adjustBy(x >= 0.75 ? 1 : -1);
-    });
-    dom.detail.power._select = detailPower;
-  }
-
-  function bindRemote() {
-    for (const btn of document.querySelectorAll('[data-tv]')) {
-      const name = btn.dataset.tv;
-      btn._select = () => runTv(name);
-    }
-  }
-
-  /* ---------------------------------------------------------------------
-     Demo mode (no env.js) — mock data for designing in a desktop browser
-     --------------------------------------------------------------------- */
-  const demo = (() => {
-    const AREAS = [
-      { id: 'living_room', name: 'Living Room', entities: ['light.living_room_ceiling', 'light.living_room_lamp', 'switch.living_room_fairy_lights', 'climate.living_room_heating', 'scene.movie_night'] },
-      { id: 'kitchen', name: 'Kitchen', entities: ['light.kitchen_spots', 'light.kitchen_under_cabinet', 'switch.kitchen_coffee_machine'] },
-      { id: 'bedroom', name: 'Bedroom', entities: ['light.bedroom_main', 'light.bedroom_bedside_left', 'light.bedroom_bedside_right', 'climate.bedroom_thermostat', 'fan.bedroom_fan'] },
-      { id: 'office', name: 'Office', entities: ['light.office_desk', 'switch.office_monitor', 'script.office_focus_mode'] },
-      { id: 'hallway', name: 'Hallway', entities: ['light.hallway', 'light.hallway_porch'] },
-      { id: 'bathroom', name: 'Bathroom', entities: ['light.bathroom', 'fan.bathroom_extractor'] },
+  function demoData(key) {
+    const now = Date.now();
+    const ago = (m) => new Date(now - m * 60000).toISOString();
+    const label = { top: 'Top stories' }[key] || SECTIONS.find((s) => s.key === key)?.label || key;
+    const base = [
+      ['BBC', 'Sample headline: rail operator announces new timetable for spring', 'Demo text. A real summary would explain what is changing, who is affected and when it starts.'],
+      ['Guardian', 'Sample headline: council sets out plans for new cycle routes', 'Demo text. Summaries are written from each outlet’s own standfirst, kept to one or two sentences.'],
+      ['BBC', 'Sample headline: weather warning issued for heavy rain', 'Demo text. Pinch Next to keep reading through the section without going back to the list.'],
+      ['Guardian', 'Sample headline: report finds rise in community volunteering', 'Demo text. Pinch Listen to hear this story read aloud through the glasses speaker.'],
+      ['BBC', 'Sample headline: new library opens after two-year refurbishment', 'Demo text. Swipe left or right on a story card to jump between sections.'],
     ];
-    const title = (id) => id.split('.')[1].split('_').map((w) => w[0].toUpperCase() + w.slice(1)).join(' ');
-    const db = new Map();
-    const ONOFF_ONLY = ['light.hallway_porch'];
-    AREAS.flatMap((a) => a.entities).forEach((id, i) => {
-      const d = domainOf(id);
-      const attributes = { friendly_name: title(id) };
-      let st;
-      if (d === 'climate') {
-        st = 'heat';
-        Object.assign(attributes, {
-          current_temperature: 19.5, temperature: 20, min_temp: 7, max_temp: 30,
-          target_temp_step: 0.5, hvac_modes: ['off', 'heat'], hvac_action: 'heating',
-        });
-      } else if (d === 'scene') {
-        st = '2026-01-01T00:00:00';
-      } else {
-        const on = TOGGLEABLE.includes(d) && i % 3 === 0;
-        st = on ? 'on' : 'off';
-        if (d === 'light') {
-          const dimmable = !ONOFF_ONLY.includes(id);
-          attributes.supported_color_modes = dimmable ? ['brightness'] : ['onoff'];
-          if (on && dimmable) attributes.brightness = 204;
-        }
-      }
-      db.set(id, { entity_id: id, state: st, attributes });
-    });
-    db.set('media_player.samsung_tv', {
-      entity_id: 'media_player.samsung_tv', state: 'on',
-      attributes: { friendly_name: 'Samsung TV', volume_level: 0.18, is_volume_muted: false },
-    });
-    db.set('remote.samsung_tv', { entity_id: 'remote.samsung_tv', state: 'on', attributes: { friendly_name: 'Samsung TV' } });
-
-    function service(domain, svc, data = {}) {
-      for (const id of [].concat(data.entity_id || [])) {
-        const s = db.get(id);
-        if (!s) continue;
-        const a = s.attributes;
-        if (domain === 'media_player') {
-          if (svc === 'toggle') s.state = s.state === 'on' ? 'off' : 'on';
-          if (svc === 'volume_up') a.volume_level = Math.min(1, +(a.volume_level + 0.02).toFixed(2));
-          if (svc === 'volume_down') a.volume_level = Math.max(0, +(a.volume_level - 0.02).toFixed(2));
-          if (svc === 'volume_mute') a.is_volume_muted = data.is_volume_muted;
-        } else if (domain === 'remote') {
-          toast(`TV ← ${data.command}`);
-        } else if (domain === 'climate') {
-          if (svc === 'set_temperature') a.temperature = data.temperature;
-          if (svc === 'turn_on') { s.state = 'heat'; a.hvac_action = 'heating'; }
-          if (svc === 'turn_off') { s.state = 'off'; a.hvac_action = 'off'; }
-        } else {
-          const dimmable = domainOf(id) === 'light' && !ONOFF_ONLY.includes(id);
-          if (svc === 'toggle') s.state = s.state === 'on' ? 'off' : 'on';
-          if (svc === 'turn_on') s.state = 'on';
-          if (svc === 'turn_off') s.state = 'off';
-          if (dimmable) {
-            if (data.brightness_pct != null) a.brightness = Math.round(data.brightness_pct * 2.55);
-            else if (s.state === 'on' && a.brightness == null) a.brightness = 204;
-            if (s.state === 'off') delete a.brightness;
-          }
-        }
-      }
-      return new Promise((r) => setTimeout(() => r([]), 120));
-    }
-
     return {
-      areas: () => structuredClone(AREAS),
-      states: () => structuredClone([...db.values()]),
-      service,
+      section: key,
+      label,
+      updated: new Date(now).toISOString(),
+      ai: false,
+      failed: [],
+      briefing: `This is a demo briefing for ${label}. When the app is connected, this will be a short spoken round-up of the most important stories in this section.`,
+      items: base.map(([source, title, summary], i) => ({
+        id: `${key}-${i}`, title: `${title}`, summary, source, link: '#', published: ago(12 + i * 47),
+      })),
     };
-  })();
+  }
 
   /* ---------------------------------------------------------------------
      Boot
      --------------------------------------------------------------------- */
-  async function init() {
+  function init() {
     startClock();
     bindInput();
-    bindRemote();
-    setStatus(DEMO ? 'demo' : 'connecting');
-
-    try {
-      await fetchStates();
-      state.areas = await fetchAreas();
-      detectTv();
-      setStatus(DEMO ? 'demo' : 'online');
-    } catch (err) {
-      console.error(err);
-      state.lastError = friendlyError(err);
-      setStatus('offline');
-      toast(state.lastError, true);
-    }
-
-    renderHome();
-    openView('home');
-    setInterval(poll, CONFIG.pollMs);
-    document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
-    if (DEMO) toast('Demo mode — mock data');
+    renderTabs();
+    if (!state.cache.top) renderLoading();
+    updateHud();
+    loadSection('top').then(focusFirstCard);
+    focusFirstCard();
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) loadSection(state.section);
+      else stopSpeaking();
+    });
+    if (DEMO) toast('Demo mode — sample stories');
   }
 
   init();
